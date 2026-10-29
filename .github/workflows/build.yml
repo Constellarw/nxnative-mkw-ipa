@@ -1,0 +1,292 @@
+# Private MKW IPA builder — loose ExeFS+RomFS from Drive zip parts (no NSP).
+# Uses private fork Constellarw/nxnative-sw2 (Ampere/NVN2).
+name: Build MKW IPA (extracted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxnative_ref:
+        description: "nxnative-sw2 git ref"
+        required: false
+        default: "main"
+      dump_source:
+        description: "auto = Release cache first; drive = force Drive parts"
+        required: false
+        type: choice
+        default: auto
+        options: [auto, drive]
+
+permissions:
+  contents: write
+
+env:
+  DUMP_TAG: mkw-dump-v1
+  TITLE_ID: "0400C3F00006E000"
+  DISPLAY_VER: "1.8.0"
+  GAME_NAME: "Mario Kart World"
+
+concurrency:
+  group: mkw-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build IPA on Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /Applications/Xcode_*.app/Contents/Developer/Platforms/iPhoneSimulator.platform \
+            /Applications/Xcode_*.app/Contents/Developer/Platforms/AppleTV*.platform \
+            /Applications/Xcode_*.app/Contents/Developer/Platforms/Watch*.platform \
+            /Applications/Xcode_*.app/Contents/Developer/Platforms/XROS*.platform \
+            /Library/Developer/CoreSimulator \
+            ~/Library/Developer/CoreSimulator \
+            /usr/local/share/android* \
+            /usr/share/dotnet \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/go \
+            || true
+          df -h /
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Metal toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain || true
+          xcrun -sdk iphoneos metal --version
+          xcrun -sdk macosx metal --version
+
+      - name: Checkout nxnative-sw2
+        uses: actions/checkout@v4
+        with:
+          repository: Constellarw/nxnative-sw2
+          ref: ${{ inputs.nxnative_ref }}
+          token: ${{ secrets.NXNATIVE_PAT || github.token }}
+          path: nxnative
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd spirv-cross glslang unar
+          brew install --cask dotnet-sdk || true
+          python3 -m venv "$HOME/nx-venv"
+          source "$HOME/nx-venv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'" gdown nsz
+          echo "$HOME/nx-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Decode prod.keys (optional for extracted)
+        env:
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/keys"
+          if [ -n "${PROD_KEYS_B64:-}" ]; then
+            echo "$PROD_KEYS_B64" | base64 --decode > "$HOME/keys/prod.keys"
+            chmod 600 "$HOME/keys/prod.keys"
+            echo "prod.keys ready ($(wc -c < "$HOME/keys/prod.keys") bytes)"
+          else
+            echo "No PROD_KEYS_B64 — continuing (extracted path)."
+          fi
+
+      - name: Restore dump from Release cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DUMP_SOURCE: ${{ inputs.dump_source }}
+        run: |
+          set -euo pipefail
+          DEST="$HOME/Games/MKW"
+          PARTS="$HOME/.ci/dump-parts"
+          mkdir -p "$DEST" "$PARTS"
+          echo "DUMP_FROM=none" >> "$GITHUB_ENV"
+          if [ "${DUMP_SOURCE:-auto}" = "drive" ]; then
+            echo "dump_source=drive: skip Release cache"
+            exit 0
+          fi
+          if ! gh release view "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "No Release $DUMP_TAG yet"
+            exit 0
+          fi
+          if ! gh release download "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" -p manifest.tsv -D "$PARTS" --clobber; then
+            echo "Incomplete Release"
+            exit 0
+          fi
+          gh release download "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" -p 'f*.part*' -D "$PARTS" --clobber
+          ok=1
+          while IFS=$'\t' read -r idx nparts size sha name; do
+            [ -n "${idx:-}" ] || continue
+            out="$DEST/$name"
+            found=$(find "$PARTS" -maxdepth 1 -name "f${idx}.part*" | wc -l | tr -d ' ')
+            if [ "$found" != "$nparts" ]; then echo "bad parts $name"; ok=0; break; fi
+            : > "$out"
+            for part in $(find "$PARTS" -maxdepth 1 -name "f${idx}.part*" | sort); do
+              cat "$part" >> "$out"; rm -f "$part"
+            done
+            got_size=$(stat -f %z "$out")
+            got_sha=$(shasum -a 256 "$out" | cut -d' ' -f1)
+            if [ "$got_size" != "$size" ] || [ "$got_sha" != "$sha" ]; then ok=0; break; fi
+          done < "$PARTS/manifest.tsv"
+          rm -rf "$PARTS"
+          if [ "$ok" = 1 ]; then
+            echo "DUMP_FROM=release" >> "$GITHUB_ENV"
+            ls -l "$DEST"
+          fi
+
+      - name: Download Drive zip parts and reassemble
+        if: env.DUMP_FROM != 'release'
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GDRIVE_FOLDER_ID:-}" ]; then
+            echo "::error::Set secret GDRIVE_FOLDER_ID to the Drive folder with mkw_*.part* files"
+            exit 1
+          fi
+          PARTS="$HOME/.ci/gdrive-parts"
+          DEST="$HOME/Games/MKW"
+          mkdir -p "$PARTS" "$DEST"
+          echo "Downloading Drive folder $GDRIVE_FOLDER_ID …"
+          gdown --folder "https://drive.google.com/drive/folders/${GDRIVE_FOLDER_ID}" -O "$PARTS" --remaining-ok || \
+            gdown --folder "$GDRIVE_FOLDER_ID" -O "$PARTS" --remaining-ok
+          ls -la "$PARTS" | head
+          # Prefer already-extracted tree if present
+          if [ -d "$PARTS/exefs" ] && [ -d "$PARTS/romfs" ]; then
+            mkdir -p "$DEST/917504"
+            cp -a "$PARTS/exefs" "$PARTS/romfs" "$DEST/917504/"
+            echo "DUMP_FROM=drive-tree" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mapfile -t parts < <(find "$PARTS" -type f -name '*.part*' | sort)
+          if [ "${#parts[@]}" -eq 0 ]; then
+            echo "::error::No .part* files in Drive folder"
+            find "$PARTS" | head -50
+            exit 1
+          fi
+          ZIP="$DEST/mkw_1.8.0_update.zip"
+          echo "Concatenating ${#parts[@]} parts → $ZIP"
+          cat "${parts[@]}" > "$ZIP"
+          rm -rf "$PARTS"
+          echo "Extracting zip…"
+          EXTRACT="$DEST/extracted"
+          mkdir -p "$EXTRACT"
+          unzip -q "$ZIP" -d "$EXTRACT" || unar -o "$EXTRACT" "$ZIP"
+          rm -f "$ZIP"
+          # Find exefs+romfs
+          EX=$(find "$EXTRACT" -type d -iname exefs | head -1)
+          RM=$(find "$EXTRACT" -type d -iname romfs | head -1)
+          if [ -z "$EX" ] || [ -z "$RM" ]; then
+            echo "::error::No exefs/romfs after extract"
+            find "$EXTRACT" -maxdepth 3 | head -80
+            exit 1
+          fi
+          VERDIR="$DEST/917504"
+          mkdir -p "$VERDIR"
+          cp -a "$EX" "$VERDIR/exefs"
+          cp -a "$RM" "$VERDIR/romfs"
+          rm -rf "$EXTRACT"
+          echo "DUMP_FROM=drive-zip" >> "$GITHUB_ENV"
+          du -sh "$VERDIR"
+
+      - name: Seed Release cache from dump
+        if: env.DUMP_FROM == 'drive-zip' || env.DUMP_FROM == 'drive-tree'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DEST="$HOME/Games/MKW"
+          # Tar the 917504 tree into parts for next run
+          TAR="$HOME/.ci/mkw917504.tar"
+          mkdir -p "$HOME/.ci"
+          tar -C "$DEST" -cf "$TAR" 917504
+          PART_DIR="$HOME/.ci/seed-parts"
+          mkdir -p "$PART_DIR"
+          split -b 90m -d -a 4 "$TAR" "$PART_DIR/f0.part"
+          rm -f "$TAR"
+          : > "$PART_DIR/manifest.tsv"
+          size=$(stat -f %z "$DEST/917504" 2>/dev/null || echo 0)
+          # recompute from reconstructed would be better; store tar size via parts
+          total=0
+          n=0
+          for p in "$PART_DIR"/f0.part*; do total=$((total + $(stat -f %z "$p"))); n=$((n+1)); done
+          sha=$(cat "$PART_DIR"/f0.part* | shasum -a 256 | cut -d' ' -f1)
+          printf "0\t%d\t%d\t%s\t%s\n" "$n" "$total" "$sha" "mkw917504.tar" > "$PART_DIR/manifest.tsv"
+          if ! gh release view "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" --title "MKW dump cache" --notes "Private cache; not a public release" || true
+          fi
+          gh release upload "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$PART_DIR/manifest.tsv" "$PART_DIR"/f0.part*
+          rm -rf "$PART_DIR"
+
+      - name: Unpack Release dump if needed
+        if: env.DUMP_FROM == 'release'
+        run: |
+          set -euo pipefail
+          DEST="$HOME/Games/MKW"
+          if [ -f "$DEST/mkw917504.tar" ]; then
+            tar -C "$DEST" -xf "$DEST/mkw917504.tar"
+            rm -f "$DEST/mkw917504.tar"
+          fi
+          test -d "$DEST/917504/exefs" && test -d "$DEST/917504/romfs"
+          du -sh "$DEST/917504"
+
+      - name: Update shader toolchain lock
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          python dm/gfx/tools/dmsh_chain.py --update-lock || true
+          python dm/gfx/tools/dmsh_chain.py --header || true
+
+      - name: Build IPA from extracted dump
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          DUMP="$HOME/Games/MKW/917504"
+          test -d "$DUMP/exefs"
+          test -d "$DUMP/romfs"
+          WORK="$RUNNER_TEMP/xbuild"
+          mkdir -p "$WORK"
+          python scripts/build_ipa_from_extracted.py "$DUMP" \
+            --title-id "$TITLE_ID" \
+            --version v917504 \
+            --display "$DISPLAY_VER" \
+            --name "$GAME_NAME" \
+            --work "$WORK" \
+            --romfs separate
+          IPA=$(find "$WORK" -name '*.ipa' | head -1)
+          if [ -z "$IPA" ]; then
+            echo "::error::No IPA produced"
+            find "$WORK" -maxdepth 3 | head -100
+            exit 1
+          fi
+          cp "$IPA" "$RUNNER_TEMP/MarioKartWorld.ipa"
+          ls -lh "$RUNNER_TEMP/MarioKartWorld.ipa"
+
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MKW-IPA
+          path: ${{ runner.temp }}/MarioKartWorld.ipa
+          retention-days: 3
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MKW-build-logs
+          path: |
+            ${{ runner.temp }}/xbuild/**/logs/**
+            ${{ runner.temp }}/xbuild/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
