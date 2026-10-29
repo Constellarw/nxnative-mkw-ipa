@@ -24,6 +24,9 @@ env:
   TITLE_ID: "0400C3F00006E000"
   DISPLAY_VER: "1.8.0"
   GAME_NAME: "Mario Kart World"
+  DM_ALLOW_OTHER_METAL: "1"
+  # Prefer in-repo locked spirv-cross (not brew)
+  SPIRV_CROSS: ${{ github.workspace }}/nxnative/dm/gfx/tools/spirv_cross_bin/spirv-cross
 
 concurrency:
   group: mkw-ipa
@@ -100,6 +103,34 @@ jobs:
             echo "No PROD_KEYS_B64 — continuing (extracted path)."
           fi
 
+
+      - name: Preflight shader toolchain (fail before dump download)
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          test -x dm/gfx/tools/spirv_cross_bin/spirv-cross
+          test -x dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate || test -f dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
+          export SPIRV_CROSS="$PWD/dm/gfx/tools/spirv_cross_bin/spirv-cross"
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "dm/gfx/tools")
+          import own_compilers as o
+          # signature must accept metal= (the bug that burned the last dump download)
+          o.check_tools(metal=True)
+          o.check_tools(metal=False)
+          print("own_compilers.check_tools(metal=) OK")
+          # smoke import path used by the build
+          import runpy, os
+          os.environ.setdefault("DM_ALLOW_OTHER_METAL", "1")
+          # do not run full dmsh_build; only verify monkeypatch assignment works
+          o.dmsh_chain.check_tools = o.check_tools
+          o.dmsh_chain.check_tools(metal=True)
+          print("monkeypatched check_tools(metal=True) OK")
+          PY
+          python dm/gfx/tools/own_compilers.py --check-metal || true
+          echo "preflight ok"
+
       - name: Download dump from private release
         env:
           GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
@@ -144,17 +175,21 @@ jobs:
           du -sh "$DEST/917504"
           echo "DUMP_FROM=private-release" >> "$GITHUB_ENV"
 
-      - name: Update shader toolchain lock
+      - name: Refresh dmsh chain header
         working-directory: nxnative
         run: |
           set -euo pipefail
-          python dm/gfx/tools/dmsh_chain.py --update-lock || true
-          python dm/gfx/tools/dmsh_chain.py --header || true
+          # Do NOT --update-lock on CI: would rewrite fingerprints to the runner and hide real mismatches.
+          python dm/gfx/tools/dmsh_chain.py --header
 
       - name: Build IPA from extracted dump
         working-directory: nxnative
+        env:
+          DM_ALLOW_OTHER_METAL: "1"
         run: |
           set -euo pipefail
+          export SPIRV_CROSS="$PWD/dm/gfx/tools/spirv_cross_bin/spirv-cross"
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
           DUMP="$HOME/Games/MKW/917504"
           test -d "$DUMP/exefs"
           test -d "$DUMP/romfs"
