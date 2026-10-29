@@ -157,8 +157,8 @@ jobs:
           DEST="$HOME/Games/MKW"
           mkdir -p "$PARTS" "$DEST"
           echo "Downloading Drive folder $GDRIVE_FOLDER_ID …"
-          gdown --folder "https://drive.google.com/drive/folders/${GDRIVE_FOLDER_ID}" -O "$PARTS" --remaining-ok || \
-            gdown --folder "$GDRIVE_FOLDER_ID" -O "$PARTS" --remaining-ok
+          gdown --folder "https://drive.google.com/drive/folders/${GDRIVE_FOLDER_ID}" -O "$PARTS" || \
+            gdown --folder "$GDRIVE_FOLDER_ID" -O "$PARTS"
           ls -la "$PARTS" | head
           # Prefer already-extracted tree if present
           if [ -d "$PARTS/exefs" ] && [ -d "$PARTS/romfs" ]; then
