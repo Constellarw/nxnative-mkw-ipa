@@ -100,104 +100,51 @@ jobs:
             echo "No PROD_KEYS_B64 — continuing (extracted path)."
           fi
 
-      - name: Restore dump from Release cache
+      - name: Download dump from private release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
           DUMP_SOURCE: ${{ inputs.dump_source }}
         run: |
           set -euo pipefail
           DEST="$HOME/Games/MKW"
           PARTS="$HOME/.ci/dump-parts"
           mkdir -p "$DEST" "$PARTS"
-          echo "DUMP_FROM=none" >> "$GITHUB_ENV"
-          if [ "${DUMP_SOURCE:-auto}" = "drive" ]; then
-            echo "dump_source=drive: skip Release cache"
-            exit 0
+          DUMP_REPO="${DUMP_CACHE_REPO:-Constellarw/nxnative-mkw-dump}"
+          TAG="${DUMP_TAG}"
+          echo "Fetching $DUMP_REPO@$TAG …"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::NXNATIVE_PAT secret required to read private dump cache"
+            exit 1
           fi
-          if ! gh release view "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "No Release $DUMP_TAG yet"
-            exit 0
-          fi
-          if ! gh release download "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" -p manifest.tsv -D "$PARTS" --clobber; then
-            echo "Incomplete Release"
-            exit 0
-          fi
-          gh release download "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" -p 'f*.part*' -D "$PARTS" --clobber
-          ok=1
-          while IFS=$'\t' read -r idx nparts size sha name; do
+          gh release download "$TAG" --repo "$DUMP_REPO" -p manifest.tsv -D "$PARTS" --clobber
+          # fail-fast: download parts one by one, verify size+sha
+          while IFS=$'\t' read -r idx name size sha; do
             [ -n "${idx:-}" ] || continue
-            out="$DEST/$name"
-            found=$(find "$PARTS" -maxdepth 1 -name "f${idx}.part*" | wc -l | tr -d ' ')
-            if [ "$found" != "$nparts" ]; then echo "bad parts $name"; ok=0; break; fi
-            : > "$out"
-            for part in $(find "$PARTS" -maxdepth 1 -name "f${idx}.part*" | sort); do
-              cat "$part" >> "$out"; rm -f "$part"
-            done
-            got_size=$(stat -f %z "$out")
-            got_sha=$(shasum -a 256 "$out" | cut -d' ' -f1)
-            if [ "$got_size" != "$size" ] || [ "$got_sha" != "$sha" ]; then ok=0; break; fi
+            echo "→ $name ($size bytes)"
+            gh release download "$TAG" --repo "$DUMP_REPO" -p "$name" -D "$PARTS" --clobber
+            got=$(stat -f %z "$PARTS/$name")
+            got_sha=$(shasum -a 256 "$PARTS/$name" | cut -d' ' -f1)
+            if [ "$got" != "$size" ] || [ "$got_sha" != "$sha" ]; then
+              echo "::error::Bad part $name size=$got/$size sha=$got_sha/$sha"
+              exit 1
+            fi
+          done < "$PARTS/manifest.tsv"
+          echo "Concatenating…"
+          : > "$DEST/mkw917504.tar"
+          while IFS=$'\t' read -r idx name size sha; do
+            [ -n "${idx:-}" ] || continue
+            cat "$PARTS/$name" >> "$DEST/mkw917504.tar"
+            rm -f "$PARTS/$name"
           done < "$PARTS/manifest.tsv"
           rm -rf "$PARTS"
-          if [ "$ok" = 1 ]; then
-            echo "DUMP_FROM=release" >> "$GITHUB_ENV"
-            ls -l "$DEST"
-          fi
+          echo "Extracting tar…"
+          tar -C "$DEST" -xf "$DEST/mkw917504.tar"
+          rm -f "$DEST/mkw917504.tar"
+          test -d "$DEST/917504/exefs" && test -d "$DEST/917504/romfs"
+          du -sh "$DEST/917504"
+          echo "DUMP_FROM=private-release" >> "$GITHUB_ENV"
 
-      - name: Download Drive zip parts and reassemble
-        if: env.DUMP_FROM != 'release'
-        env:
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GDRIVE_FOLDER_ID:-}" ]; then
-            echo "::error::Set secret GDRIVE_FOLDER_ID to the Drive folder with mkw_*.part* files"
-            exit 1
-          fi
-          PARTS="$HOME/.ci/gdrive-parts"
-          DEST="$HOME/Games/MKW"
-          mkdir -p "$PARTS" "$DEST"
-          echo "Downloading Drive folder $GDRIVE_FOLDER_ID …"
-          gdown --folder "https://drive.google.com/drive/folders/${GDRIVE_FOLDER_ID}" -O "$PARTS" || \
-            gdown --folder "$GDRIVE_FOLDER_ID" -O "$PARTS"
-          ls -la "$PARTS" | head
-          # Prefer already-extracted tree if present
-          if [ -d "$PARTS/exefs" ] && [ -d "$PARTS/romfs" ]; then
-            mkdir -p "$DEST/917504"
-            cp -a "$PARTS/exefs" "$PARTS/romfs" "$DEST/917504/"
-            echo "DUMP_FROM=drive-tree" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          mapfile -t parts < <(find "$PARTS" -type f -name '*.part*' | sort)
-          if [ "${#parts[@]}" -eq 0 ]; then
-            echo "::error::No .part* files in Drive folder"
-            find "$PARTS" | head -50
-            exit 1
-          fi
-          ZIP="$DEST/mkw_1.8.0_update.zip"
-          echo "Concatenating ${#parts[@]} parts → $ZIP"
-          cat "${parts[@]}" > "$ZIP"
-          rm -rf "$PARTS"
-          echo "Extracting zip…"
-          EXTRACT="$DEST/extracted"
-          mkdir -p "$EXTRACT"
-          unzip -q "$ZIP" -d "$EXTRACT" || unar -o "$EXTRACT" "$ZIP"
-          rm -f "$ZIP"
-          # Find exefs+romfs
-          EX=$(find "$EXTRACT" -type d -iname exefs | head -1)
-          RM=$(find "$EXTRACT" -type d -iname romfs | head -1)
-          if [ -z "$EX" ] || [ -z "$RM" ]; then
-            echo "::error::No exefs/romfs after extract"
-            find "$EXTRACT" -maxdepth 3 | head -80
-            exit 1
-          fi
-          VERDIR="$DEST/917504"
-          mkdir -p "$VERDIR"
-          cp -a "$EX" "$VERDIR/exefs"
-          cp -a "$RM" "$VERDIR/romfs"
-          rm -rf "$EXTRACT"
-          echo "DUMP_FROM=drive-zip" >> "$GITHUB_ENV"
-          du -sh "$VERDIR"
-
+      - name: Seed Release cache from dump
       - name: Seed Release cache from dump
         if: (env.DUMP_FROM == 'drive-zip' || env.DUMP_FROM == 'drive-tree') && github.event.repository.private
         env:
