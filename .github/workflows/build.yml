@@ -35,40 +35,83 @@ concurrency:
 jobs:
   build:
     name: Build IPA on Apple Silicon
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
-      - name: Free disk space
+      # nxnative-sw2 dm/ios/project.yml targets iOS 26.0 (Metal 4: MTL4CommandQueue …), so the
+      # iOS 26 SDK is mandatory. macos-14 only ships Xcode <= 16.2 (iOS 18.2 SDK) and is
+      # unsupported from 2026-11-02, so build on macos-26 with a pinned Xcode 26.x.
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.6"
+
+      - name: Free disk space (keep selected Xcode + its iOS platform)
         run: |
           set -euo pipefail
           df -h /
+          SEL_DEV=$(xcode-select -p)
+          SEL_APP=$(cd "$SEL_DEV/../.." && pwd -P)
+          echo "Selected Xcode: $SEL_APP"
+          # Remove every other Xcode bundle (symlinks resolved so the selected one survives).
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            real=$(cd "$app" 2>/dev/null && pwd -P) || continue
+            if [ "$real" != "$SEL_APP" ] && [ ! -L "$app" ]; then
+              echo "rm $app"; sudo rm -rf "$app" || true
+            fi
+          done
+          # Non-iOS platforms of the selected Xcode. iPhoneOS/iPhoneSimulator are KEPT:
+          # without the iOS platform+runtime xcodebuild reports "iOS X is not installed"
+          # for generic/platform=iOS (run 40832351948).
           sudo rm -rf \
-            /Applications/Xcode_*.app/Contents/Developer/Platforms/iPhoneSimulator.platform \
-            /Applications/Xcode_*.app/Contents/Developer/Platforms/AppleTV*.platform \
-            /Applications/Xcode_*.app/Contents/Developer/Platforms/Watch*.platform \
-            /Applications/Xcode_*.app/Contents/Developer/Platforms/XROS*.platform \
-            /Library/Developer/CoreSimulator \
-            ~/Library/Developer/CoreSimulator \
+            "$SEL_DEV"/Platforms/AppleTV*.platform \
+            "$SEL_DEV"/Platforms/Watch*.platform \
+            "$SEL_DEV"/Platforms/XR*.platform \
             /usr/local/share/android* \
             /usr/share/dotnet \
             /opt/hostedtoolcache/CodeQL \
             /opt/hostedtoolcache/go \
             || true
+          # Drop non-iOS simulator runtimes only (best effort).
+          xcrun simctl runtime list -j > /tmp/rt.json 2>/dev/null || echo '{}' > /tmp/rt.json
+          python3 - <<'PY' | while read -r id; do xcrun simctl runtime delete "$id" || true; done
+          import json
+          d = json.load(open('/tmp/rt.json'))
+          for k, v in d.items():
+              if v.get('platformIdentifier', '').find('iphonesimulator') < 0:
+                  print(k)
+          PY
           df -h /
 
-      - name: Select Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: Install Metal toolchain
+      - name: Install Metal toolchain + iOS platform
         run: |
           set -euo pipefail
           xcodebuild -version
           xcodebuild -downloadComponent MetalToolchain || true
           xcrun -sdk iphoneos metal --version
           xcrun -sdk macosx metal --version
+          need_ios=0
+          xcrun --sdk iphoneos --show-sdk-version || need_ios=1
+          SDKV=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo none)
+          # The generic iOS device destination also needs the matching iOS runtime.
+          xcrun simctl list runtimes | tee /tmp/runtimes.txt
+          grep -E "^iOS ${SDKV}( |\.)" /tmp/runtimes.txt > /tmp/iosrt.txt || true
+          grep -qv unavailable /tmp/iosrt.txt || need_ios=1
+          if [ "$need_ios" = 1 ]; then
+            echo "iOS platform/runtime for SDK $SDKV missing -> xcodebuild -downloadPlatform iOS"
+            ok=0
+            for i in 1 2 3; do
+              if xcodebuild -downloadPlatform iOS; then ok=1; break; fi
+              echo "downloadPlatform attempt $i failed; retrying in 30s"; sleep 30
+            done
+            [ "$ok" = 1 ] || { echo "::error::xcodebuild -downloadPlatform iOS failed"; exit 1; }
+          else
+            echo "iOS SDK $SDKV + runtime already installed"
+          fi
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun simctl list runtimes
 
       - name: Checkout nxnative-sw2
         uses: actions/checkout@v4
@@ -104,7 +147,7 @@ jobs:
           fi
 
 
-      - name: Preflight shader toolchain (fail before dump download)
+      - name: Preflight shader toolchain + iOS destination (fail before dump download)
         working-directory: nxnative
         run: |
           set -euo pipefail
@@ -116,6 +159,39 @@ jobs:
           export DM_ALLOW_OTHER_METAL=1
           python -c "import sys; sys.path.insert(0,'dm/gfx/tools'); import own_compilers as o; o.check_tools(metal=True); o.check_tools(metal=False); o.dmsh_chain.check_tools=o.check_tools; o.dmsh_chain.check_tools(metal=True); print('own_compilers.check_tools(metal=) OK')"
           python dm/gfx/tools/own_compilers.py --check-metal || true
+          # --- iOS destination probe: same destination + deployment target as build_ipa.sh ---
+          IOS_MIN=$(python3 -c "import re;t=open('dm/ios/project.yml').read();print(re.search(r'iOS:\s*\"?([0-9.]+)',t).group(1))")
+          SDKV=$(xcrun --sdk iphoneos --show-sdk-version) || { echo "::error::iOS SDK missing (xcrun --sdk iphoneos)"; exit 1; }
+          echo "iOS SDK $SDKV, project deployment target $IOS_MIN"
+          python3 -c "import sys;v=lambda s:tuple(map(int,s.split('.')));sys.exit(0 if v('$SDKV')>=v('$IOS_MIN') else 1)" \
+            || { echo "::error::iOS SDK $SDKV < deployment target $IOS_MIN (wrong Xcode)"; exit 1; }
+          P="$RUNNER_TEMP/iosprobe"; rm -rf "$P"; mkdir -p "$P/Src"
+          printf '#import <Metal/Metal.h>\nint main(void){ Protocol *p = @protocol(MTL4CommandQueue); return p ? 0 : 1; }\n' > "$P/Src/main.m"
+          cat > "$P/project.yml" <<YML
+          name: Probe
+          options:
+            bundleIdPrefix: ci.probe
+            deploymentTarget:
+              iOS: "$IOS_MIN"
+          targets:
+            Probe:
+              type: application
+              platform: iOS
+              sources: [Src]
+              scheme: {}
+              info:
+                path: Info.plist
+          YML
+          (cd "$P" && xcodegen generate --quiet)
+          (cd "$P" && xcodebuild -project Probe.xcodeproj -scheme Probe -showdestinations) | tee "$P/dest.txt"
+          if grep -q "is not installed" "$P/dest.txt"; then
+            echo "::error::iOS platform not installed for xcodebuild (see destinations above)"; exit 1
+          fi
+          (cd "$P" && xcodebuild -project Probe.xcodeproj -scheme Probe -configuration Release \
+             -destination 'generic/platform=iOS' -derivedDataPath "$P/dd" \
+             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build > "$P/build.log" 2>&1) \
+            || { tail -40 "$P/build.log"; echo "::error::iOS probe build (generic/platform=iOS) failed before dump download"; exit 1; }
+          echo "iOS destination probe OK (SDK $SDKV)"
           echo "preflight ok"
 
       - name: Download dump from private release
