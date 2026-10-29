@@ -72,7 +72,7 @@ jobs:
         with:
           repository: Constellarw/nxnative-sw2
           ref: ${{ inputs.nxnative_ref }}
-          token: ${{ secrets.NXNATIVE_PAT || github.token }}
+          token: ${{ secrets.NXNATIVE_PAT }}
           path: nxnative
 
       - name: Install build tools
@@ -120,7 +120,7 @@ jobs:
           # fail-fast: download parts one by one, verify size+sha
           while IFS=$'\t' read -r idx name size sha; do
             [ -n "${idx:-}" ] || continue
-            echo "→ $name ($size bytes)"
+            echo "part $name ($size bytes)"
             gh release download "$TAG" --repo "$DUMP_REPO" -p "$name" -D "$PARTS" --clobber
             got=$(stat -f %z "$PARTS/$name")
             got_sha=$(shasum -a 256 "$PARTS/$name" | cut -d' ' -f1)
@@ -143,50 +143,6 @@ jobs:
           test -d "$DEST/917504/exefs" && test -d "$DEST/917504/romfs"
           du -sh "$DEST/917504"
           echo "DUMP_FROM=private-release" >> "$GITHUB_ENV"
-
-      - name: Seed Release cache from dump
-      - name: Seed Release cache from dump
-        if: (env.DUMP_FROM == 'drive-zip' || env.DUMP_FROM == 'drive-tree') && github.event.repository.private
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Never seed dump onto a public repo release (IP)
-          DEST="$HOME/Games/MKW"
-          # Tar the 917504 tree into parts for next run
-          TAR="$HOME/.ci/mkw917504.tar"
-          mkdir -p "$HOME/.ci"
-          tar -C "$DEST" -cf "$TAR" 917504
-          PART_DIR="$HOME/.ci/seed-parts"
-          mkdir -p "$PART_DIR"
-          split -b 90m -d -a 4 "$TAR" "$PART_DIR/f0.part"
-          rm -f "$TAR"
-          : > "$PART_DIR/manifest.tsv"
-          size=$(stat -f %z "$DEST/917504" 2>/dev/null || echo 0)
-          # recompute from reconstructed would be better; store tar size via parts
-          total=0
-          n=0
-          for p in "$PART_DIR"/f0.part*; do total=$((total + $(stat -f %z "$p"))); n=$((n+1)); done
-          sha=$(cat "$PART_DIR"/f0.part* | shasum -a 256 | cut -d' ' -f1)
-          printf "0\t%d\t%d\t%s\t%s\n" "$n" "$total" "$sha" "mkw917504.tar" > "$PART_DIR/manifest.tsv"
-          if ! gh release view "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" --title "MKW dump cache" --notes "Private cache; not a public release" || true
-          fi
-          gh release upload "$DUMP_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
-            "$PART_DIR/manifest.tsv" "$PART_DIR"/f0.part*
-          rm -rf "$PART_DIR"
-
-      - name: Unpack Release dump if needed
-        if: env.DUMP_FROM == 'release'
-        run: |
-          set -euo pipefail
-          DEST="$HOME/Games/MKW"
-          if [ -f "$DEST/mkw917504.tar" ]; then
-            tar -C "$DEST" -xf "$DEST/mkw917504.tar"
-            rm -f "$DEST/mkw917504.tar"
-          fi
-          test -d "$DEST/917504/exefs" && test -d "$DEST/917504/romfs"
-          du -sh "$DEST/917504"
 
       - name: Update shader toolchain lock
         working-directory: nxnative
