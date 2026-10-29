@@ -199,11 +199,12 @@ jobs:
           du -sh "$VERDIR"
 
       - name: Seed Release cache from dump
-        if: env.DUMP_FROM == 'drive-zip' || env.DUMP_FROM == 'drive-tree'
+        if: (env.DUMP_FROM == 'drive-zip' || env.DUMP_FROM == 'drive-tree') && github.event.repository.private
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Never seed dump onto a public repo release (IP)
           DEST="$HOME/Games/MKW"
           # Tar the 917504 tree into parts for next run
           TAR="$HOME/.ci/mkw917504.tar"
