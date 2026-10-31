@@ -1,0 +1,383 @@
+# Pokemon Pokopia IPA builder (macos-26, Xcode 26.x, native Metal) — loose ExeFS+RomFS, same pattern as build.yml (MKW).
+# Resumable shader compile: 97,469 NVN2 shaders do not fit one 6 h job, so every run
+#   1. pulls the shader seed chunks (*.manifest.tsv) of SEED_TAG in the private dump repo: finished keys from the Linux box (linux*) and from earlier runs (ci*),
+#   2. builds only the keys no chunk has (DM_SHADER_BATCH batches, Linux driver order), until the time budget,
+#   3. uploads the keys it finished as a new chunk ci<run>-<attempt>, so the next run continues from there,
+#   4. once every key is built: stamps the library and builds the IPA (uploaded to the private repo, not as a public artifact).
+# Re-run the workflow until the summary says "all shaders built".
+name: Build Pokopia IPA (extracted, resumable shaders)
+
+on:
+  workflow_dispatch:
+    inputs:
+      nxnative_ref:
+        description: "nxnative-sw2 git ref (Pokopia tree)"
+        required: false
+        default: "cursor/pokopia-mac-ci"
+      dump_source:
+        description: "auto = private release first, Drive folder fallback; drive = force Drive"
+        required: false
+        type: choice
+        default: auto
+        options: [auto, drive]
+      batch_size:
+        description: "shader keys per batch"
+        required: false
+        default: "3000"
+      budget_min:
+        description: "stop starting new shader batches after this many minutes of the job"
+        required: false
+        default: "250"
+      build_ipa:
+        description: "build the IPA when every shader is done"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  PRIV_REPO: Constellarw/nxnative-mkw-dump
+  DUMP_TAG: pokopia-dump-v1
+  SEED_TAG: pokopia-shader-seed-v1
+  IPA_TAG: pokopia-ipa
+  TITLE_ID: "0400A3A01EE4C000"
+  VERSION: "v327680"
+  DISPLAY_VER: "5.0.0"
+  GAME_NAME: "Pokemon Pokopia"
+  DRIVE_FOLDER: "16MPZ4gidzunjpnwV8dTrdc2Hz3NjVT0B"
+  DM_ALLOW_OTHER_METAL: "1"
+  SPIRV_CROSS: ${{ github.workspace }}/nxnative/dm/gfx/tools/spirv_cross_bin/spirv-cross
+
+concurrency:
+  group: pokopia-ipa
+  cancel-in-progress: false   # a running job may be uploading its shader chunk
+
+jobs:
+  build:
+    name: Build Pokopia IPA on Apple Silicon
+    runs-on: macos-26
+    timeout-minutes: 355
+
+    steps:
+      - name: Job start
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout workflow helpers
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      # nxnative-sw2 dm/ios/project.yml targets iOS 26.0 (Metal 4: MTL4CommandQueue …), so the
+      # iOS 26 SDK is mandatory. macos-14 only ships Xcode <= 16.2 (iOS 18.2 SDK) and is
+      # unsupported from 2026-11-02, so build on macos-26 with a pinned Xcode 26.x.
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.6"
+
+      - name: Free disk space (keep selected Xcode + its iOS platform)
+        run: |
+          set -euo pipefail
+          df -h /
+          SEL_DEV=$(xcode-select -p)
+          SEL_APP=$(cd "$SEL_DEV/../.." && pwd -P)
+          echo "Selected Xcode: $SEL_APP"
+          # Remove every other Xcode bundle (symlinks resolved so the selected one survives).
+          for app in /Applications/Xcode*.app; do
+            [ -e "$app" ] || continue
+            real=$(cd "$app" 2>/dev/null && pwd -P) || continue
+            if [ "$real" != "$SEL_APP" ] && [ ! -L "$app" ]; then
+              echo "rm $app"; sudo rm -rf "$app" || true
+            fi
+          done
+          # Non-iOS platforms of the selected Xcode. iPhoneOS/iPhoneSimulator are KEPT:
+          # without the iOS platform+runtime xcodebuild reports "iOS X is not installed"
+          # for generic/platform=iOS (run 40832351948).
+          sudo rm -rf \
+            "$SEL_DEV"/Platforms/AppleTV*.platform \
+            "$SEL_DEV"/Platforms/Watch*.platform \
+            "$SEL_DEV"/Platforms/XR*.platform \
+            /usr/local/share/android* \
+            /usr/share/dotnet \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/go \
+            || true
+          # Drop non-iOS simulator runtimes only (best effort).
+          xcrun simctl runtime list -j > /tmp/rt.json 2>/dev/null || echo '{}' > /tmp/rt.json
+          python3 - <<'PY' | while read -r id; do xcrun simctl runtime delete "$id" || true; done
+          import json
+          d = json.load(open('/tmp/rt.json'))
+          for k, v in d.items():
+              if v.get('platformIdentifier', '').find('iphonesimulator') < 0:
+                  print(k)
+          PY
+          df -h /
+
+      - name: Install Metal toolchain + iOS platform
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild -downloadComponent MetalToolchain || true
+          xcrun -sdk iphoneos metal --version
+          xcrun -sdk macosx metal --version
+          need_ios=0
+          xcrun --sdk iphoneos --show-sdk-version || need_ios=1
+          SDKV=$(xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || echo none)
+          # The generic iOS device destination also needs the matching iOS runtime.
+          xcrun simctl list runtimes | tee /tmp/runtimes.txt
+          grep -E "^iOS ${SDKV}( |\.)" /tmp/runtimes.txt > /tmp/iosrt.txt || true
+          grep -qv unavailable /tmp/iosrt.txt || need_ios=1
+          if [ "$need_ios" = 1 ]; then
+            echo "iOS platform/runtime for SDK $SDKV missing -> xcodebuild -downloadPlatform iOS"
+            ok=0
+            for i in 1 2 3; do
+              if xcodebuild -downloadPlatform iOS; then ok=1; break; fi
+              echo "downloadPlatform attempt $i failed; retrying in 30s"; sleep 30
+            done
+            [ "$ok" = 1 ] || { echo "::error::xcodebuild -downloadPlatform iOS failed"; exit 1; }
+          else
+            echo "iOS SDK $SDKV + runtime already installed"
+          fi
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun simctl list runtimes
+
+      - name: Checkout nxnative-sw2
+        uses: actions/checkout@v4
+        with:
+          repository: Constellarw/nxnative-sw2
+          ref: ${{ inputs.nxnative_ref }}
+          token: ${{ secrets.NXNATIVE_PAT }}
+          path: nxnative
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd spirv-cross glslang unar
+          brew install --cask dotnet-sdk || true
+          python3 -m venv "$HOME/nx-venv"
+          source "$HOME/nx-venv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install lz4 capstone fonttools "backports.zstd; python_version < '3.14'" gdown nsz
+          echo "$HOME/nx-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Decode prod.keys (optional for extracted)
+        env:
+          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/keys"
+          if [ -n "${PROD_KEYS_B64:-}" ]; then
+            echo "$PROD_KEYS_B64" | base64 --decode > "$HOME/keys/prod.keys"
+            chmod 600 "$HOME/keys/prod.keys"
+            echo "prod.keys ready ($(wc -c < "$HOME/keys/prod.keys") bytes)"
+          else
+            echo "No PROD_KEYS_B64 — continuing (extracted path)."
+          fi
+
+
+      - name: Preflight shader toolchain + iOS destination (fail before dump download)
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          chmod +x dm/gfx/tools/spirv_cross_bin/spirv-cross dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate || true
+          test -f dm/gfx/tools/spirv_cross_bin/spirv-cross
+          test -f dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
+          export SPIRV_CROSS="$PWD/dm/gfx/tools/spirv_cross_bin/spirv-cross"
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
+          export DM_ALLOW_OTHER_METAL=1
+          python -c "import sys; sys.path.insert(0,'dm/gfx/tools'); import own_compilers as o; o.check_tools(metal=True); o.check_tools(metal=False); o.dmsh_chain.check_tools=o.check_tools; o.dmsh_chain.check_tools(metal=True); print('own_compilers.check_tools(metal=) OK')"
+          python dm/gfx/tools/own_compilers.py --check-metal || true
+          # --- iOS destination probe: same destination + deployment target as build_ipa.sh ---
+          IOS_MIN=$(python3 -c "import re;t=open('dm/ios/project.yml').read();print(re.search(r'iOS:\s*\"?([0-9.]+)',t).group(1))")
+          SDKV=$(xcrun --sdk iphoneos --show-sdk-version) || { echo "::error::iOS SDK missing (xcrun --sdk iphoneos)"; exit 1; }
+          echo "iOS SDK $SDKV, project deployment target $IOS_MIN"
+          python3 -c "import sys;v=lambda s:tuple(map(int,s.split('.')));sys.exit(0 if v('$SDKV')>=v('$IOS_MIN') else 1)" \
+            || { echo "::error::iOS SDK $SDKV < deployment target $IOS_MIN (wrong Xcode)"; exit 1; }
+          P="$RUNNER_TEMP/iosprobe"; rm -rf "$P"; mkdir -p "$P/Src"
+          printf '#import <Metal/Metal.h>\nint main(void){ Protocol *p = @protocol(MTL4CommandQueue); return p ? 0 : 1; }\n' > "$P/Src/main.m"
+          cat > "$P/project.yml" <<YML
+          name: Probe
+          options:
+            bundleIdPrefix: ci.probe
+            deploymentTarget:
+              iOS: "$IOS_MIN"
+          targets:
+            Probe:
+              type: application
+              platform: iOS
+              sources: [Src]
+              scheme: {}
+              info:
+                path: Info.plist
+          YML
+          (cd "$P" && xcodegen generate --quiet)
+          (cd "$P" && xcodebuild -project Probe.xcodeproj -scheme Probe -showdestinations) | tee "$P/dest.txt"
+          if grep -q "is not installed" "$P/dest.txt"; then
+            echo "::error::iOS platform not installed for xcodebuild (see destinations above)"; exit 1
+          fi
+          (cd "$P" && xcodebuild -project Probe.xcodeproj -scheme Probe -configuration Release \
+             -destination 'generic/platform=iOS' -derivedDataPath "$P/dd" \
+             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build > "$P/build.log" 2>&1) \
+            || { tail -40 "$P/build.log"; echo "::error::iOS probe build (generic/platform=iOS) failed before dump download"; exit 1; }
+          echo "iOS destination probe OK (SDK $SDKV)"
+          echo "preflight ok"
+
+      - name: Download Pokopia dump (private release, Drive fallback)
+        env:
+          GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
+          DUMP_SOURCE: ${{ inputs.dump_source }}
+        run: |
+          set -euo pipefail
+          DEST="$HOME/Games/Pokopia"; mkdir -p "$DEST"
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::NXNATIVE_PAT secret required (nxnative-sw2 + private dump repo)"; exit 1; }
+          got=0
+          if [ "$DUMP_SOURCE" != drive ] && gh release view "$DUMP_TAG" --repo "$PRIV_REPO" --json assets -q '.assets[].name' | grep -qx manifest.tsv; then
+            echo "Fetching $PRIV_REPO@$DUMP_TAG"
+            bash ci/.github/pokopia/fetch_parts.sh "$PRIV_REPO" "$DUMP_TAG" manifest.tsv "$DEST/dump.tar"
+            tar -C "$DEST" -xf "$DEST/dump.tar"; rm -f "$DEST/dump.tar"; got=1
+            echo "DUMP_FROM=private-release" >> "$GITHUB_ENV"
+          fi
+          if [ "$got" = 0 ]; then
+            echo "Drive folder $DRIVE_FOLDER (gdown; may hit Drive quota from Actions IPs)"
+            mkdir -p "$DEST/drive"
+            gdown --folder "https://drive.google.com/drive/folders/$DRIVE_FOLDER" -O "$DEST/drive" --quiet
+            Z=$(find "$DEST/drive" -name '*.zip' | head -1); [ -n "$Z" ] || { echo "::error::no zip in the Drive folder"; exit 1; }
+            unar -q -o "$DEST/drive" "$Z"; rm -f "$Z"
+            U=$(find "$DEST/drive" -type d -path '*/updates/327680' | head -1); [ -n "$U" ] || { echo "::error::updates/327680 not in the zip"; exit 1; }
+            mv "$U" "$DEST/327680"; rm -rf "$DEST/drive"
+            echo "DUMP_FROM=drive" >> "$GITHUB_ENV"
+          fi
+          test -e "$DEST/327680/exefs/main" && test -d "$DEST/327680/romfs"
+          du -sh "$DEST/327680"; df -h /
+
+      - name: Refresh dmsh chain header
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          python dm/gfx/tools/dmsh_chain.py --header
+          CHAIN=$(sed -n 's/.*DMSH_CHAIN "\(.*\)".*/\1/p' dm/gfx/nvn/dmsh_chain.h)
+          echo "chain $CHAIN"; echo "CHAIN=$CHAIN" >> "$GITHUB_ENV"
+
+      - name: Front stages (layout, profile, rewrite, shader split)
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
+          WORK="$RUNNER_TEMP/xbuild"; mkdir -p "$WORK"; echo "WORK=$WORK" >> "$GITHUB_ENV"
+          python scripts/build_ipa_from_extracted.py "$HOME/Games/Pokopia/327680" --title-id "$TITLE_ID" --version "$VERSION" \
+            --display "$DISPLAY_VER" --name "$GAME_NAME" --work "$WORK" --romfs separate --stop-after split
+          test -s "$WORK/profile/$TITLE_ID/shader_map.tsv"
+
+      - name: Shader seed (finished keys from Linux + earlier runs)
+        env:
+          GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
+        run: |
+          set -euo pipefail
+          SH="$WORK/shader"; SEED="$RUNNER_TEMP/seed"; mkdir -p "$SH" "$SEED"
+          : > "$SEED/done_keys.txt"
+          mans=$(gh release view "$SEED_TAG" --repo "$PRIV_REPO" --json assets -q '.assets[].name' 2>/dev/null | grep '\.manifest\.tsv$' | sort || true)
+          [ -n "$mans" ] || echo "::warning::no seed chunks in $PRIV_REPO@$SEED_TAG: building every shader"
+          for m in $mans; do
+            c=${m%.manifest.tsv}; echo "seed chunk $c"
+            bash ci/.github/pokopia/fetch_parts.sh "$PRIV_REPO" "$SEED_TAG" "$m" "$SEED/$c.tar.zst"
+            mkdir -p "$SEED/$c"; rm -rf "$SH/meta"
+            zstd -d -q -c "$SEED/$c.tar.zst" | tar -x -C "$SH" -f -
+            rm -f "$SEED/$c.tar.zst"; mv "$SH/meta" "$SEED/$c/meta"
+            if [ -f "$SEED/$c/meta/chain.txt" ] && [ "$(cat "$SEED/$c/meta/chain.txt")" != "$CHAIN" ]; then
+              echo "::error::seed chunk $c is chain $(cat "$SEED/$c/meta/chain.txt"), this tree is $CHAIN: its libraries would not load"; exit 1
+            fi
+            cat "$SEED/$c/meta/done_keys.txt" >> "$SEED/done_keys.txt"
+          done
+          sort -u -o "$SEED/done_keys.txt" "$SEED/done_keys.txt"
+          echo "seeded keys: $(wc -l < "$SEED/done_keys.txt")"
+          ls "$SH" ; du -sh "$SH"/* || true
+          python3 ci/.github/pokopia/plan.py "$WORK/profile/$TITLE_ID" "$SEED/done_keys.txt" "$RUNNER_TEMP/batches" "${{ inputs.batch_size }}" | tee "$RUNNER_TEMP/plan.txt"
+          df -h /
+
+      - name: Build remaining shaders (time-budgeted batches)
+        working-directory: nxnative
+        run: |
+          set -uo pipefail
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
+          B="$RUNNER_TEMP/batches"; NEW="$RUNNER_TEMP/new_keys.txt"; : > "$NEW"
+          budget=$(( ${{ inputs.budget_min }} * 60 ))
+          for f in "$B"/b[0-9][0-9][0-9]; do
+            [ -e "$f" ] || continue
+            el=$(( $(date +%s) - JOB_T0 ))
+            if [ "$el" -gt "$budget" ]; then echo "time budget reached after $((el/60)) min: stopping before $(basename "$f")"; break; fi
+            echo "--- $(basename "$f") $(wc -l < "$f") keys at $((el/60)) min, free $(df -h / | awk 'NR==2{print $4}')"
+            DM_SHADER_BATCH="$f" python scripts/build_ipa_from_extracted.py "$HOME/Games/Pokopia/327680" --title-id "$TITLE_ID" --version "$VERSION" \
+              --display "$DISPLAY_VER" --name "$GAME_NAME" --work "$WORK" --romfs separate --stop-after shaders > "$f.log" 2>&1
+            if grep -E "^  shaders [0-9]+:" "$f.log"; then cat "$f" >> "$NEW"; touch "$f.done"
+            else echo "::error::batch $(basename "$f") failed"; tail -40 "$f.log"; break; fi
+            rm -rf "$WORK/shader/cache/cas"
+          done
+          left=0; for f in "$B"/b[0-9][0-9][0-9]; do [ -e "$f" ] && [ ! -e "$f.done" ] && left=$((left+1)); done
+          echo "new keys this run: $(wc -l < "$NEW"); batches left: $left"
+          echo "BATCHES_LEFT=$left" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Upload this run's shaders as a seed chunk
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
+        run: |
+          set -euo pipefail
+          NEW="$RUNNER_TEMP/new_keys.txt"
+          [ -s "$NEW" ] || { echo "no new keys"; exit 0; }
+          C="ci${{ github.run_id }}-${{ github.run_attempt }}"; P="$RUNNER_TEMP/pack"; mkdir -p "$P/meta"
+          cp "$NEW" "$P/meta/done_keys.txt"; echo "$CHAIN" > "$P/meta/chain.txt"
+          python3 ci/.github/pokopia/pack_keys.py "$WORK/shader" "$CHAIN" "$NEW" "$P/files.txt"
+          tar -cf - -C "$P" meta -C "$WORK/shader" -T "$P/files.txt" | zstd -T0 -9 -q -o "$P/$C.tar.zst"
+          ls -lh "$P/$C.tar.zst"
+          gh release view "$SEED_TAG" --repo "$PRIV_REPO" >/dev/null 2>&1 || gh release create "$SEED_TAG" --repo "$PRIV_REPO" --title "Pokopia shader seed" --notes "Resumable shader chunks for build-pokopia.yml"
+          bash ci/.github/pokopia/upload_parts.sh "$PRIV_REPO" "$SEED_TAG" "$C" "$P/$C.tar.zst"
+
+      - name: Stamp library + build IPA (all shaders done)
+        if: env.BATCHES_LEFT == '0' && inputs.build_ipa
+        working-directory: nxnative
+        run: |
+          set -euo pipefail
+          export XLATE="$PWD/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate"
+          V="$WORK/shader/cache/b-$CHAIN"; VI="$WORK/shader/ios/b-$CHAIN"; P="$WORK/profile/$TITLE_ID"
+          export DM_GAME="$TITLE_ID" DM_GAMES_DIR="$WORK/profile" DM_GAMES_FIRST=1
+          python -c "import sys; sys.path.insert(0,'dm/gfx/tools'); import dmsh_chain; g=dmsh_chain.load_game(); d=dmsh_chain.inputs(g); [dmsh_chain.write_stamp(l, g.id, d) for l in sys.argv[1:]]; print('stamp', g.id, d)" "$V" "$VI"
+          python dm/gfx/tools/c1_guard.py "$V" "$P/c1_full.tsv" | tail -1
+          python dm/gfx/tools/cb_extent.py "$V" "$P/cb_extent.tsv" | tail -1
+          find "$V" -name '*.metal' -delete
+          DM_SKIP_SHADER_BUILD=1 python scripts/build_ipa_from_extracted.py "$HOME/Games/Pokopia/327680" --title-id "$TITLE_ID" --version "$VERSION" \
+            --display "$DISPLAY_VER" --name "$GAME_NAME" --work "$WORK" --romfs separate
+          IPA=$(find "$WORK" -maxdepth 1 -name '*.ipa' | head -1); [ -n "$IPA" ] || IPA=$(find "$WORK" -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error::No IPA produced"; exit 1; }
+          cp "$IPA" "$RUNNER_TEMP/PokemonPokopia.ipa"; ls -lh "$RUNNER_TEMP/PokemonPokopia.ipa"; shasum -a 256 "$RUNNER_TEMP/PokemonPokopia.ipa"
+          echo "IPA_READY=1" >> "$GITHUB_ENV"
+
+      - name: Upload IPA to the private repo
+        if: env.IPA_READY == '1'
+        env:
+          GH_TOKEN: ${{ secrets.NXNATIVE_PAT }}
+        run: |
+          set -euo pipefail
+          T="$IPA_TAG-${{ github.run_id }}"
+          gh release create "$T" --repo "$PRIV_REPO" --title "Pokopia IPA (run ${{ github.run_id }})" --notes "build-pokopia.yml, nxnative ${{ inputs.nxnative_ref }}, chain $CHAIN" "$RUNNER_TEMP/PokemonPokopia.ipa"
+          echo "IPA: https://github.com/$PRIV_REPO/releases/tag/$T" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### Pokopia"; cat "$RUNNER_TEMP/plan.txt" 2>/dev/null || true
+            echo; echo "new keys this run: $(wc -l < "$RUNNER_TEMP/new_keys.txt" 2>/dev/null || echo 0); batches left: ${BATCHES_LEFT:-?}"
+            [ "${BATCHES_LEFT:-1}" = 0 ] && echo "all shaders built" || echo "re-run this workflow to continue the shader compile"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pokopia-build-logs
+          path: |
+            ${{ runner.temp }}/xbuild/logs/**
+            ${{ runner.temp }}/batches/*.log
+          if-no-files-found: ignore
+          retention-days: 7
