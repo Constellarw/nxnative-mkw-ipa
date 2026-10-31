@@ -1,9 +1,9 @@
 #!/bin/bash
-# upload_parts.sh <repo> <tag> <prefix> <file>: split <file> into 1900 MB parts named <prefix>.partNN, write <prefix>.manifest.tsv, upload parts then the manifest
+# upload_parts.sh <repo> <tag> <prefix> <file>: split <file> into 900 MB parts named <prefix>.partNN, write <prefix>.manifest.tsv, upload parts then the manifest
 # (the manifest last, so a half-uploaded chunk is never picked up by the next run).
 set -euo pipefail
 REPO=$1; TAG=$2; PFX=$3; F=$4; D=$(dirname "$F")
-(cd "$D" && split -b 1900m -a 2 "$(basename "$F")" "$PFX.part")   # macOS split: alphabetic suffixes
+(cd "$D" && split -b 900m -a 2 "$(basename "$F")" "$PFX.part")   # macOS split: alphabetic suffixes
 rm -f "$F"
 : > "$D/$PFX.manifest.tsv"; i=0
 for p in "$D/$PFX".part*; do
